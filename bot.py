@@ -1,12 +1,12 @@
 """
 Refresh by Coco — WhatsApp Chat Summary Bot for Telegram
 Paste WhatsApp chat messages OR send a zip file → get structured summary in 6 categories.
+Supports chunking for very long chats (>150k chars) to stay within Claude's token limit.
 """
 
 import os
 import io
 import zipfile
-import tempfile
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -16,6 +16,7 @@ import anthropic
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
+MAX_CHARS_PER_CHUNK = 150000  # ~150k chars ≈ safe under 200k token limit
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -85,6 +86,21 @@ ATURAN FORMAT:
 - Satuan selalu BOTOL, bukan buah/kg
 """
 
+MERGE_PROMPT = """Kamu menerima beberapa ringkasan parsial dari chat WhatsApp yang sangat panjang (dipecah jadi beberapa bagian).
+
+Tugasmu: GABUNGKAN semua ringkasan parsial menjadi SATU ringkasan final yang lengkap dan rapi.
+
+Aturan:
+- Kalau merchant yang sama muncul di beberapa bagian, gabungkan datanya (jangan duplikat)
+- Untuk restock, jumlahkan atau list semua tanggal restock
+- Untuk POSM, ambil status terbaru
+- Untuk retur, gabungkan semua kejadian
+- Untuk churn dan libur, pastikan tidak ada duplikat
+- Untuk isu lainnya, gabungkan semua poin unik
+- Output tetap dalam format 6 kategori yang sama
+- Output dalam Bahasa Indonesia
+"""
+
 
 def extract_text_from_zip(zip_bytes: bytes) -> str:
     """Extract .txt file contents from a WhatsApp export zip."""
@@ -96,21 +112,86 @@ def extract_text_from_zip(zip_bytes: bytes) -> str:
     return "\n".join(text_parts)
 
 
+def split_chat_into_chunks(text: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
+    """Split long chat text into chunks, breaking at newlines to avoid cutting mid-message."""
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    lines = text.split("\n")
+    current_chunk = []
+    current_len = 0
+
+    for line in lines:
+        line_len = len(line) + 1  # +1 for newline
+        if current_len + line_len > max_chars and current_chunk:
+            chunks.append("\n".join(current_chunk))
+            current_chunk = []
+            current_len = 0
+        current_chunk.append(line)
+        current_len += line_len
+
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+
+    return chunks
+
+
 async def call_claude(chat_text: str) -> str:
-    """Send chat text to Claude and return the summary."""
+    """Send chat text to Claude and return the summary. Handles chunking for long chats."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = client.messages.create(
+    chunks = split_chat_into_chunks(chat_text)
+
+    if len(chunks) == 1:
+        # Short enough — single call
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Tolong ringkas chat WhatsApp berikut:\n\n{chunks[0]}",
+                }
+            ],
+        )
+        return response.content[0].text
+
+    # Long chat — summarize each chunk, then merge
+    logger.info(f"Chat too long ({len(chat_text)} chars), splitting into {len(chunks)} chunks")
+    partial_summaries = []
+
+    for i, chunk in enumerate(chunks):
+        logger.info(f"Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Tolong ringkas chat WhatsApp berikut (bagian {i+1} dari {len(chunks)}):\n\n{chunk}",
+                }
+            ],
+        )
+        partial_summaries.append(f"=== RINGKASAN BAGIAN {i+1} ===\n{response.content[0].text}")
+
+    # Merge all partial summaries into one
+    all_summaries = "\n\n".join(partial_summaries)
+    logger.info(f"Merging {len(chunks)} partial summaries")
+
+    merge_response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
+        max_tokens=8192,
+        system=MERGE_PROMPT,
         messages=[
             {
                 "role": "user",
-                "content": f"Tolong ringkas chat WhatsApp berikut:\n\n{chat_text}",
+                "content": f"Gabungkan ringkasan-ringkasan parsial berikut menjadi satu ringkasan final:\n\n{all_summaries}",
             }
         ],
     )
-    return response.content[0].text
+    return merge_response.content[0].text
 
 
 async def send_long_message(update: Update, text: str):
@@ -207,6 +288,13 @@ async def summarize_document(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "File-nya kosong atau terlalu pendek — pastikan ini file export WhatsApp yang benar."
             )
             return
+
+        num_chunks = len(split_chat_into_chunks(chat_text))
+        if num_chunks > 1:
+            await update.message.reply_text(
+                f"💬 Chat sangat panjang ({len(chat_text):,} karakter), dipecah jadi {num_chunks} bagian. "
+                f"Proses akan memakan waktu lebih lama..."
+            )
 
         logger.info(f"Extracted {len(chat_text)} chars from {file_name}")
 
