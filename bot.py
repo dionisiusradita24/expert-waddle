@@ -1,7 +1,7 @@
 """
 Refresh by Coco — WhatsApp Chat Summary Bot for Telegram
-Paste WhatsApp chat messages OR send a zip file → get structured summary in 6 categories.
-Supports date filtering, chunking for long chats, and /cancel to stop processing.
+Supports two modes: RESTOCK (daily ops) and BD (business development).
+Includes date filtering, chunking, /cancel support.
 """
 
 import os
@@ -32,7 +32,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Conversation states ---
-WAITING_FOR_DATE = 1
+WAITING_FOR_CONTEXT = 1
+WAITING_FOR_DATE = 2
 
 # --- Month name mapping (Indonesian) ---
 MONTH_MAP = {
@@ -50,8 +51,11 @@ MONTH_MAP = {
     "desember": 12, "des": 12,
 }
 
-# --- System Prompt ---
-SYSTEM_PROMPT = """Kamu adalah asisten operasional untuk bisnis "Refresh by Coco" — air kelapa murni segar yang di-repackage ke botol 330ml.
+# =====================================================================
+# SYSTEM PROMPTS
+# =====================================================================
+
+RESTOCK_PROMPT = """Kamu adalah asisten operasional untuk bisnis "Refresh by Coco" — air kelapa murni segar yang di-repackage ke botol 330ml.
 
 KONTEKS BISNIS:
 - Shelf life sangat pendek: 5–6 hari
@@ -61,30 +65,40 @@ KONTEKS BISNIS:
 - Harga jual: ~Rp 10.000/botol
 - Kompetitor: Hydro Coco (Rp 10.000), CocoNico (Rp 15.000)
 - Program insentif kasir: jual 5 = Rp 5.000 bonus, jual 10 = Rp 10.000
+- Beberapa toko bayar langsung (cash saat restock), beberapa bayar bulanan
 
 TIM YANG ADA DI CHAT:
 - Dionisius Radita (Radit) — Co-owner, ops lead
 - Benedict Anthony (Ben) — Co-owner, business partner
 - Mas Risky (nama WhatsApp: "qiw qiw") — Kurir lapangan / sales
 - Mas Heri — Kurir / field sales lainnya
+- Nama lain yang muncul = kemungkinan karyawan baru, catat saja
 
 TUGAS:
-Ketika user mengirimkan copy-paste chat WhatsApp, ringkas ke dalam 6 kategori berikut menggunakan format tabel/poin. Output HARUS dalam Bahasa Indonesia.
+Ringkas chat WhatsApp ke dalam 6 kategori berikut. Output HARUS dalam Bahasa Indonesia.
+Karena Telegram tidak support tabel HTML, gunakan format monospace block (```) untuk tabel supaya kolom sejajar.
 
 6 KATEGORI OUTPUT:
 
 1. RESTOCK MERCHANT
+   Format kolom: Nama Toko | Tgl | Jumlah | Status Bayar | Keterangan
    - Merchant mana yang di-restock, berapa botol, kapan
-   - Perhatikan angka botol yang disebutkan
    - "Titip" / "isi" / "taruh" = restock
+   - Status bayar: "Lunas [jumlah]" / "Bayar bulanan" / "Belum bayar" / "Tidak disebutkan"
+   - "Bayar" / "udah bayar" / "cash" / "transfer" = lunas. Catat jumlahnya kalau disebutkan.
+   - "Nanti aja" / "akhir bulan" / "bulanan" = bayar bulanan
+   - Satuan selalu BOTOL
 
 2. POSM (Poster / Akrilik)
-   - Merchant mana yang sudah punya poster dan/atau akrilik standing
-   - Merchant mana yang belum / menolak pasang
-   - "Tempel" / "pasang" / "akrilik" / "poster" = POSM
+   Format kolom: Nama Toko | Poster | Akrilik | Info dari Karyawan | Alasan Tidak Pasang
+   - Poster: "Ada" / "Tidak ada" / "Tidak disebutkan"
+   - Akrilik: "Ada" / "Tidak ada" / "Tidak disebutkan"
+   - Info dari karyawan: "Ya" / "Tidak" — apakah karyawan/kurir melaporkan status POSM
+   - Alasan tidak pasang: isi alasannya kalau disebutkan (misal "gamau", "tidak ada tempat", "belum sempat"), atau "-" kalau sudah ada atau tidak disebutkan
+   - "Tempel" / "pasang" / "poster" / "akrilik" = POSM
 
 3. RETUR / PRODUK EXPIRED
-   - Produk yang dikembalikan karena expired atau tidak laku
+   Format kolom: Nama Toko | Tgl | Jumlah | Keterangan
    - Karena shelf life pendek, retur itu NORMAL dan sering terjadi
    - "Ambil balik" / "tarik" / "expired" / "basi" / "exp" = retur
 
@@ -94,8 +108,7 @@ Ketika user mengirimkan copy-paste chat WhatsApp, ringkas ke dalam 6 kategori be
    - "Gamau lagi" / "stop" / "tarik semua" = churn
 
 5. MERCHANT LIBUR / TUTUP SEMENTARA
-   - Merchant yang tutup sementara (libur, pulkam, renovasi, dll)
-   - Sertakan tanggal buka kembali kalau ada
+   Format kolom: Nama Toko | Mulai Libur | Buka Kembali | Keterangan
    - "Libur" / "pulkam" / "tutup dulu" = libur sementara
 
 6. TOPIK / ISU LAINNYA
@@ -107,34 +120,103 @@ Ketika user mengirimkan copy-paste chat WhatsApp, ringkas ke dalam 6 kategori be
 
 ATURAN FORMAT:
 - Output dalam Bahasa Indonesia
-- Gunakan format tabel untuk Restock, POSM, Retur, dan Merchant Libur
-- Gunakan poin untuk Churn dan Isu Lainnya
+- Gunakan monospace block (```) untuk semua tabel supaya kolom sejajar di Telegram
+- Gunakan poin (-) untuk Churn dan Isu Lainnya
 - Kalau suatu kategori tidak ada datanya, tulis "Tidak ada data untuk periode ini"
-- Chat yang masuk biasanya sangat kasual dan informal (bahasa gaul Indonesia)
-- Perhatikan konteks — "enci" = pemilik toko (Tionghoa), "GOR" = lapangan badminton
-- Satuan selalu BOTOL, bukan buah/kg
+- Chat sangat kasual dan informal (bahasa gaul Indonesia)
+- "enci" = pemilik toko (Tionghoa), "GOR" = lapangan badminton
 """
 
-MERGE_PROMPT = """Kamu menerima beberapa ringkasan parsial dari chat WhatsApp yang sangat panjang (dipecah jadi beberapa bagian).
+BD_PROMPT = """Kamu adalah asisten business development untuk bisnis "Refresh by Coco" — air kelapa murni segar yang di-repackage ke botol 330ml.
+
+KONTEKS BISNIS:
+- Air kelapa murni 330ml, shelf life 5–6 hari
+- Model konsinyasi — produk dititip di kulkas merchant
+- Harga jual: ~Rp 10.000/botol
+- Target merchant baru: minimarket, restoran, lapangan badminton (GOR), kafe, dll
+
+TIM YANG ADA DI CHAT:
+- Dionisius Radita (Radit) — Co-owner, ops lead
+- Benedict Anthony (Ben) — Co-owner, business partner
+- BD Sales — karyawan BD (bisa lebih dari satu, catat nama yang muncul)
+- Nama lain yang muncul = kemungkinan karyawan baru atau kontak toko, catat saja
+
+TUGAS:
+Ringkas chat WhatsApp dari grup BD ke dalam kategori berikut. Output HARUS dalam Bahasa Indonesia.
+Karena Telegram tidak support tabel HTML, gunakan format monospace block (```) untuk tabel.
+
+KATEGORI OUTPUT:
+
+1. TOKO YANG DIKUNJUNGI (prospek)
+   Format kolom: Nama Toko | Tgl | Sampel | Status | Next Step | Stok Masuk | No HP | Keterangan
+   - Sampel: berapa botol sampel yang diberikan ("kasih sampel" / "coba" / "tester")
+   - Status: "OK jadi merchant" / "Pending" / "Reject" / "Follow up"
+   - Next step (kalau reject/pending): apa yang perlu dilakukan selanjutnya
+   - Stok masuk (kalau OK): berapa botol pertama yang dititip
+   - No HP: nomor telepon toko/pemilik kalau disebutkan
+   - Keterangan: info tambahan (lokasi, tipe toko, nama pemilik, alasan reject, dll)
+
+2. TOKO REJECT
+   - Toko yang menolak jadi merchant
+   - Sertakan alasan reject kalau disebutkan
+   - "Gamau" / "ga tertarik" / "udah ada supplier" / "reject" = reject
+
+3. FOLLOW UP
+   - Toko yang perlu di-follow up / dikunjungi lagi
+   - Tanggal follow up kalau disebutkan
+   - Status terakhir (misal: "sudah kasih sampel, tunggu feedback")
+
+4. TOPIK / ISU LAINNYA
+   - Masalah di lapangan (area susah dijangkau, parkir, dll)
+   - Insight pasar (kompetitor, harga pasaran, permintaan)
+   - Strategi atau arahan dari owner
+   - Hal lain yang relevan
+
+ATURAN FORMAT:
+- Output dalam Bahasa Indonesia
+- Gunakan monospace block (```) untuk tabel
+- Gunakan poin (-) untuk Reject, Follow Up, dan Isu Lainnya
+- Kalau suatu kategori tidak ada datanya, tulis "Tidak ada data untuk periode ini"
+- Chat sangat kasual dan informal (bahasa gaul Indonesia)
+- "enci" = pemilik toko (Tionghoa), "GOR" = lapangan badminton
+"""
+
+MERGE_RESTOCK_PROMPT = """Kamu menerima beberapa ringkasan parsial dari chat WhatsApp operasional (restock) yang dipecah jadi beberapa bagian.
 
 Tugasmu: GABUNGKAN semua ringkasan parsial menjadi SATU ringkasan final yang lengkap dan rapi.
 
 Aturan:
 - Kalau merchant yang sama muncul di beberapa bagian, gabungkan datanya (jangan duplikat)
-- Untuk restock, jumlahkan atau list semua tanggal restock
+- Untuk restock, gabungkan semua tanggal dan jumlah. Status bayar ambil yang terbaru.
 - Untuk POSM, ambil status terbaru
 - Untuk retur, gabungkan semua kejadian
 - Untuk churn dan libur, pastikan tidak ada duplikat
 - Untuk isu lainnya, gabungkan semua poin unik
 - Output tetap dalam format 6 kategori yang sama
+- Gunakan monospace block (```) untuk tabel
+- Output dalam Bahasa Indonesia
+"""
+
+MERGE_BD_PROMPT = """Kamu menerima beberapa ringkasan parsial dari chat WhatsApp BD (business development) yang dipecah jadi beberapa bagian.
+
+Tugasmu: GABUNGKAN semua ringkasan parsial menjadi SATU ringkasan final yang lengkap dan rapi.
+
+Aturan:
+- Kalau toko yang sama muncul di beberapa bagian, gabungkan datanya (jangan duplikat)
+- Ambil status terbaru untuk setiap toko
+- Untuk reject dan follow up, pastikan tidak ada duplikat
+- Untuk isu lainnya, gabungkan semua poin unik
+- Output tetap dalam format kategori BD yang sama
+- Gunakan monospace block (```) untuk tabel
 - Output dalam Bahasa Indonesia
 """
 
 
-# --- Date parsing ---
+# =====================================================================
+# DATE PARSING & FILTERING
+# =====================================================================
 
 def parse_date_range(text: str) -> tuple[datetime | None, datetime | None]:
-    """Parse Indonesian date range from user input."""
     text = text.strip().lower()
     now = datetime.now()
     year = now.year
@@ -163,7 +245,6 @@ def parse_date_range(text: str) -> tuple[datetime | None, datetime | None]:
         start = end.replace(day=1, hour=0, minute=0, second=0)
         return start, end.replace(hour=23, minute=59, second=59)
 
-    # "D-D month" (e.g., "1-15 maret")
     m = re.match(r"(\d{1,2})\s*[-–]\s*(\d{1,2})\s+(\w+)(?:\s+(\d{4}))?", text)
     if m:
         day1, day2, month_str, year_str = m.groups()
@@ -171,13 +252,10 @@ def parse_date_range(text: str) -> tuple[datetime | None, datetime | None]:
         if month:
             y = int(year_str) if year_str else year
             try:
-                start = datetime(y, month, int(day1), 0, 0, 0)
-                end = datetime(y, month, int(day2), 23, 59, 59)
-                return start, end
+                return datetime(y, month, int(day1), 0, 0, 0), datetime(y, month, int(day2), 23, 59, 59)
             except ValueError:
                 pass
 
-    # "D month - D month"
     m = re.match(
         r"(\d{1,2})\s+(\w+)\s*[-–]|sampai|sampe|s/d\s*(\d{1,2})\s+(\w+)(?:\s+(\d{4}))?",
         text,
@@ -191,9 +269,7 @@ def parse_date_range(text: str) -> tuple[datetime | None, datetime | None]:
         if m1 and m2 and day1 and day2:
             y = int(year_str) if year_str else year
             try:
-                start = datetime(y, m1, int(day1), 0, 0, 0)
-                end = datetime(y, m2, int(day2), 23, 59, 59)
-                return start, end
+                return datetime(y, m1, int(day1), 0, 0, 0), datetime(y, m2, int(day2), 23, 59, 59)
             except ValueError:
                 pass
 
@@ -201,7 +277,6 @@ def parse_date_range(text: str) -> tuple[datetime | None, datetime | None]:
 
 
 def filter_chat_by_date(chat_text: str, start_date: datetime, end_date: datetime) -> str:
-    """Filter WhatsApp chat lines to only include messages within the date range."""
     lines = chat_text.split("\n")
     filtered = []
     include_line = False
@@ -230,16 +305,24 @@ def filter_chat_by_date(chat_text: str, start_date: datetime, end_date: datetime
                 matched = True
                 break
 
-        if not matched:
-            pass
-
         if include_line:
             filtered.append(line)
 
     return "\n".join(filtered)
 
 
-# --- Text chunking ---
+# =====================================================================
+# TEXT CHUNKING & CLAUDE API
+# =====================================================================
+
+def extract_text_from_zip(zip_bytes: bytes) -> str:
+    text_parts = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+        for name in sorted(zf.namelist()):
+            if name.endswith(".txt"):
+                text_parts.append(zf.read(name).decode("utf-8", errors="replace"))
+    return "\n".join(text_parts)
+
 
 def split_chat_into_chunks(text: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
     if len(text) <= max_chars:
@@ -265,17 +348,17 @@ def split_chat_into_chunks(text: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> l
     return chunks
 
 
-# --- Claude API (with cancellation support) ---
-
 class CancelledError(Exception):
-    """Raised when user cancels processing."""
     pass
 
 
-async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Send chat text to Claude. Checks context.user_data['cancel'] between chunks."""
+async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE, mode: str = "restock") -> str:
+    """Send chat text to Claude with the appropriate prompt based on mode."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     chunks = split_chat_into_chunks(chat_text)
+
+    system_prompt = RESTOCK_PROMPT if mode == "restock" else BD_PROMPT
+    merge_prompt = MERGE_RESTOCK_PROMPT if mode == "restock" else MERGE_BD_PROMPT
 
     def _check_cancelled():
         if context.user_data.get("cancel"):
@@ -286,7 +369,7 @@ async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE) -> str
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=4096,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[
                 {
                     "role": "user",
@@ -303,7 +386,6 @@ async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE) -> str
         _check_cancelled()
         if i > 0:
             logger.info(f"Waiting 65 seconds to avoid rate limit...")
-            # Use asyncio.sleep so the bot can still receive /cancel during the wait
             for _ in range(65):
                 _check_cancelled()
                 await asyncio.sleep(1)
@@ -311,7 +393,7 @@ async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE) -> str
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=4096,
-            system=SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[
                 {
                     "role": "user",
@@ -321,7 +403,6 @@ async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE) -> str
         )
         partial_summaries.append(f"=== RINGKASAN BAGIAN {i+1} ===\n{response.content[0].text}")
 
-    # Merge
     _check_cancelled()
     all_summaries = "\n\n".join(partial_summaries)
     logger.info(f"Waiting 65 seconds before merge step...")
@@ -333,7 +414,7 @@ async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE) -> str
     merge_response = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=8192,
-        system=MERGE_PROMPT,
+        system=merge_prompt,
         messages=[
             {
                 "role": "user",
@@ -353,19 +434,21 @@ async def send_long_message(update: Update, text: str):
             await update.message.reply_text(chunk)
 
 
-# --- Handlers ---
+# =====================================================================
+# HANDLERS
+# =====================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Halo! Aku bot ringkasan WhatsApp untuk Refresh by Coco 🥥\n\n"
         "Cara pakai:\n"
         "1. Kirim file zip / txt dari WhatsApp export\n"
-        "2. Aku akan tanya range tanggal yang mau diringkas\n"
-        "3. Ketik tanggalnya (misal: 1-15 maret)\n"
+        "2. Pilih konteks: Restock atau BD\n"
+        "3. Masukkan range tanggal\n"
         "4. Tunggu sebentar, ringkasan muncul!\n\n"
         "Atau paste chat langsung sebagai text.\n\n"
-        "Kirim /cancel untuk membatalkan proses.\n"
-        "Kirim /help untuk bantuan."
+        "/cancel — Batalkan proses\n"
+        "/help — Bantuan lengkap"
     )
 
 
@@ -374,49 +457,40 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 Perintah:\n"
         "/start — Mulai bot\n"
         "/help — Bantuan\n"
-        "/cancel — Batalkan proses yang sedang berjalan\n\n"
-        "📎 Kirim file zip/txt → bot tanya tanggal → ringkasan\n"
-        "📝 Atau paste chat langsung sebagai text\n\n"
-        "Format tanggal yang didukung:\n"
+        "/cancel — Batalkan proses\n\n"
+        "📎 Kirim file zip/txt → pilih konteks → tanggal → ringkasan\n"
+        "📝 Atau paste chat langsung (default: mode Restock)\n\n"
+        "2 mode tersedia:\n"
+        "• Restock — ringkasan operasional harian (6 kategori)\n"
+        "• BD — ringkasan business development (4 kategori)\n\n"
+        "Format tanggal:\n"
         "• 1-15 maret\n"
-        "• 1 maret - 15 maret\n"
-        "• minggu ini\n"
-        "• minggu lalu\n"
-        "• bulan ini\n"
-        "• bulan lalu\n"
-        "• semua (tanpa filter)\n\n"
-        "6 kategori ringkasan:\n"
-        "1. Restock Merchant\n"
-        "2. POSM (Poster/Akrilik)\n"
-        "3. Retur / Produk Expired\n"
-        "4. Merchant Churn\n"
-        "5. Merchant Libur\n"
-        "6. Topik / Isu Lainnya"
+        "• minggu ini / minggu lalu\n"
+        "• bulan ini / bulan lalu\n"
+        "• semua (tanpa filter)"
     )
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Global /cancel — works anytime, sets cancel flag for running processes."""
     context.user_data["cancel"] = True
     context.user_data.pop("chat_text", None)
+    context.user_data.pop("mode", None)
     await update.message.reply_text("⛔ Proses dibatalkan. Kirim file baru kapanpun.")
     return ConversationHandler.END
 
 
 async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: Receive file, store it, ask for date range."""
+    """Step 1: Receive file, ask for context (Restock or BD)."""
     doc = update.message.document
     file_name = doc.file_name or ""
 
     if not (file_name.endswith(".zip") or file_name.endswith(".txt")):
         await update.message.reply_text(
-            "Format file tidak didukung. Kirim file .zip atau .txt dari WhatsApp export ya!"
+            "Format file tidak didukung. Kirim file .zip atau .txt ya!"
         )
         return ConversationHandler.END
 
-    # Reset cancel flag for new process
     context.user_data["cancel"] = False
-
     await update.message.chat.send_action("typing")
 
     try:
@@ -437,15 +511,12 @@ async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             f"📂 File diterima! ({len(chat_text):,} karakter)\n\n"
-            "Mau ringkasan untuk tanggal berapa?\n\n"
-            "Contoh:\n"
-            "• 1-15 maret\n"
-            "• minggu ini\n"
-            "• bulan lalu\n"
-            "• semua (tanpa filter tanggal)\n\n"
-            "Ketik /cancel untuk membatalkan."
+            "Ini chat untuk konteks apa?\n\n"
+            "1️⃣ Ketik restock — Ringkasan operasional (restock, POSM, retur, dll)\n"
+            "2️⃣ Ketik bd — Ringkasan business development (prospek toko baru, reject, dll)\n\n"
+            "/cancel untuk membatalkan"
         )
-        return WAITING_FOR_DATE
+        return WAITING_FOR_CONTEXT
 
     except zipfile.BadZipFile:
         await update.message.reply_text("File zip-nya rusak. Coba export ulang dari WhatsApp.")
@@ -456,27 +527,47 @@ async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 
-def extract_text_from_zip(zip_bytes: bytes) -> str:
-    text_parts = []
-    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
-        for name in sorted(zf.namelist()):
-            if name.endswith(".txt"):
-                text_parts.append(zf.read(name).decode("utf-8", errors="replace"))
-    return "\n".join(text_parts)
+async def receive_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: Receive context selection (restock or bd), ask for date range."""
+    text = update.message.text.strip().lower()
+
+    if text in ("restock", "1", "restok"):
+        context.user_data["mode"] = "restock"
+        mode_label = "Restock (operasional)"
+    elif text in ("bd", "2", "bisdev", "business development"):
+        context.user_data["mode"] = "bd"
+        mode_label = "BD (business development)"
+    else:
+        await update.message.reply_text(
+            "Tidak dikenali. Ketik restock atau bd ya.\n\n"
+            "1️⃣ restock — Ringkasan operasional\n"
+            "2️⃣ bd — Ringkasan business development"
+        )
+        return WAITING_FOR_CONTEXT
+
+    await update.message.reply_text(
+        f"✅ Mode: {mode_label}\n\n"
+        "Mau ringkasan untuk tanggal berapa?\n\n"
+        "Contoh:\n"
+        "• 1-15 maret\n"
+        "• minggu ini\n"
+        "• bulan lalu\n"
+        "• semua (tanpa filter tanggal)"
+    )
+    return WAITING_FOR_DATE
 
 
 async def receive_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 2: Receive date range, filter chat, summarize."""
+    """Step 3: Receive date range, filter chat, summarize."""
     date_input = update.message.text
     chat_text = context.user_data.get("chat_text", "")
+    mode = context.user_data.get("mode", "restock")
 
     if not chat_text:
         await update.message.reply_text("Tidak ada file yang tersimpan. Kirim ulang file-nya ya.")
         return ConversationHandler.END
 
-    # Reset cancel flag
     context.user_data["cancel"] = False
-
     start_date, end_date = parse_date_range(date_input)
 
     if start_date and end_date:
@@ -486,20 +577,22 @@ async def receive_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if len(filtered_text.strip()) < 50:
             await update.message.reply_text(
                 f"Tidak ada pesan ditemukan untuk periode {date_label}.\n"
-                "Coba range tanggal lain, atau ketik 'semua' untuk proses tanpa filter."
+                "Coba range tanggal lain, atau ketik 'semua'."
             )
             return WAITING_FOR_DATE
 
         await update.message.reply_text(
             f"📅 Filter: {date_label}\n"
             f"📊 {len(filtered_text):,} karakter (dari {len(chat_text):,} total)\n"
-            "⏳ Memproses ringkasan... (kirim /cancel untuk membatalkan)"
+            f"🔧 Mode: {'Restock' if mode == 'restock' else 'BD'}\n"
+            "⏳ Memproses... (kirim /cancel untuk membatalkan)"
         )
         process_text = filtered_text
     else:
         await update.message.reply_text(
             f"📊 Memproses semua chat ({len(chat_text):,} karakter)...\n"
-            "⏳ Ini mungkin memakan waktu lebih lama. (kirim /cancel untuk membatalkan)"
+            f"🔧 Mode: {'Restock' if mode == 'restock' else 'BD'}\n"
+            "⏳ Mungkin memakan waktu lebih lama. (kirim /cancel untuk membatalkan)"
         )
         process_text = chat_text
 
@@ -513,7 +606,7 @@ async def receive_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.chat.send_action("typing")
 
     try:
-        summary = await call_claude(process_text, context)
+        summary = await call_claude(process_text, context, mode)
         await send_long_message(update, summary)
     except CancelledError:
         await update.message.reply_text("⛔ Proses dibatalkan. Kirim file baru kapanpun.")
@@ -522,12 +615,13 @@ async def receive_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"Maaf, ada error: {str(e)[:200]}")
 
     context.user_data.pop("chat_text", None)
+    context.user_data.pop("mode", None)
     context.user_data["cancel"] = False
     return ConversationHandler.END
 
 
 async def summarize_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle plain text paste (no file, no date filter needed)."""
+    """Handle plain text paste — defaults to restock mode."""
     chat_text = update.message.text
 
     if len(chat_text) < 50:
@@ -540,7 +634,7 @@ async def summarize_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
 
     try:
-        summary = await call_claude(chat_text, context)
+        summary = await call_claude(chat_text, context, "restock")
         await send_long_message(update, summary)
     except CancelledError:
         await update.message.reply_text("⛔ Proses dibatalkan.")
@@ -549,16 +643,22 @@ async def summarize_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Maaf, ada error: {str(e)[:200]}")
 
 
+# =====================================================================
+# MAIN
+# =====================================================================
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Global /cancel handler — highest priority
     app.add_handler(CommandHandler("cancel", cancel_command), group=-1)
 
-    # Conversation handler for file + date filter flow
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Document.ALL, receive_document)],
         states={
+            WAITING_FOR_CONTEXT: [
+                CommandHandler("cancel", cancel_command),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_context),
+            ],
             WAITING_FOR_DATE: [
                 CommandHandler("cancel", cancel_command),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_date_range),
