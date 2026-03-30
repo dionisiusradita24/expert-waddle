@@ -17,7 +17,7 @@ import anthropic
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
-MAX_CHARS_PER_CHUNK = 150000  # ~150k chars ≈ safe under 200k token limit
+MAX_CHARS_PER_CHUNK = 50000  # ~50k chars ≈ ~15k tokens, safe under 30k token/min rate limit
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
