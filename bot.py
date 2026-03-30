@@ -6,6 +6,7 @@ Supports chunking for very long chats (>150k chars) to stay within Claude's toke
 
 import os
 import io
+import time
 import zipfile
 import logging
 from telegram import Update
@@ -162,6 +163,10 @@ async def call_claude(chat_text: str) -> str:
     partial_summaries = []
 
     for i, chunk in enumerate(chunks):
+        # Wait between chunks to avoid rate limit (30k tokens/min on free tier)
+        if i > 0:
+            logger.info(f"Waiting 65 seconds to avoid rate limit...")
+            time.sleep(65)
         logger.info(f"Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
         response = client.messages.create(
             model=CLAUDE_MODEL,
@@ -176,8 +181,10 @@ async def call_claude(chat_text: str) -> str:
         )
         partial_summaries.append(f"=== RINGKASAN BAGIAN {i+1} ===\n{response.content[0].text}")
 
-    # Merge all partial summaries into one
+    # Merge all partial summaries into one — wait for rate limit first
     all_summaries = "\n\n".join(partial_summaries)
+    logger.info(f"Waiting 65 seconds before merge step...")
+    time.sleep(65)
     logger.info(f"Merging {len(chunks)} partial summaries")
 
     merge_response = client.messages.create(
@@ -291,9 +298,10 @@ async def summarize_document(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         num_chunks = len(split_chat_into_chunks(chat_text))
         if num_chunks > 1:
+            est_minutes = num_chunks * 1.5  # ~1.5 min per chunk (65s wait + processing)
             await update.message.reply_text(
                 f"💬 Chat sangat panjang ({len(chat_text):,} karakter), dipecah jadi {num_chunks} bagian. "
-                f"Proses akan memakan waktu lebih lama..."
+                f"Estimasi waktu: ~{int(est_minutes)} menit. Sabar ya!"
             )
 
         logger.info(f"Extracted {len(chat_text)} chars from {file_name}")
