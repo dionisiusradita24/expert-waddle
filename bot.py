@@ -1,9 +1,12 @@
 """
 Refresh by Coco — WhatsApp Chat Summary Bot for Telegram
-Paste WhatsApp chat messages → get structured summary in 6 categories.
+Paste WhatsApp chat messages OR send a zip file → get structured summary in 6 categories.
 """
 
 import os
+import io
+import zipfile
+import tempfile
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -83,12 +86,49 @@ ATURAN FORMAT:
 """
 
 
+def extract_text_from_zip(zip_bytes: bytes) -> str:
+    """Extract .txt file contents from a WhatsApp export zip."""
+    text_parts = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+        for name in sorted(zf.namelist()):
+            if name.endswith(".txt"):
+                text_parts.append(zf.read(name).decode("utf-8", errors="replace"))
+    return "\n".join(text_parts)
+
+
+async def call_claude(chat_text: str) -> str:
+    """Send chat text to Claude and return the summary."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
+        system=SYSTEM_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Tolong ringkas chat WhatsApp berikut:\n\n{chat_text}",
+            }
+        ],
+    )
+    return response.content[0].text
+
+
+async def send_long_message(update: Update, text: str):
+    """Send a message, splitting into chunks if over Telegram's 4096 char limit."""
+    if len(text) <= 4096:
+        await update.message.reply_text(text)
+    else:
+        chunks = [text[i : i + 4096] for i in range(0, len(text), 4096)]
+        for chunk in chunks:
+            await update.message.reply_text(chunk)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Halo! Aku bot ringkasan WhatsApp untuk Refresh by Coco 🥥\n\n"
         "Cara pakai:\n"
-        "1. Copy chat WhatsApp kamu\n"
-        "2. Paste langsung ke sini\n"
+        "1. Copy-paste chat WhatsApp langsung ke sini, ATAU\n"
+        "2. Kirim file zip dari WhatsApp export\n"
         "3. Tunggu sebentar, ringkasan akan muncul\n\n"
         "Format chat yang didukung:\n"
         "- [09:15] Nama: pesan...\n"
@@ -103,7 +143,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 Perintah yang tersedia:\n"
         "/start — Mulai bot\n"
         "/help — Tampilkan bantuan ini\n\n"
-        "Cukup paste chat WhatsApp-mu, dan aku akan meringkasnya ke 6 kategori:\n"
+        "Kirim chat WhatsApp (paste text atau zip file), dan aku akan meringkasnya ke 6 kategori:\n"
         "1. Restock Merchant\n"
         "2. POSM (Poster/Akrilik)\n"
         "3. Retur / Produk Expired\n"
@@ -113,43 +153,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def summarize_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle plain text messages."""
     chat_text = update.message.text
 
-    # Skip very short messages
     if len(chat_text) < 50:
         await update.message.reply_text(
             "Pesannya terlalu pendek — paste chat WhatsApp yang lebih panjang ya!"
         )
         return
 
-    # Send "typing" indicator
     await update.message.chat.send_action("typing")
 
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Tolong ringkas chat WhatsApp berikut:\n\n{chat_text}",
-                }
-            ],
-        )
-
-        summary = response.content[0].text
-
-        # Telegram has a 4096 char limit per message — split if needed
-        if len(summary) <= 4096:
-            await update.message.reply_text(summary)
-        else:
-            chunks = [summary[i : i + 4096] for i in range(0, len(summary), 4096)]
-            for chunk in chunks:
-                await update.message.reply_text(chunk)
-
+        summary = await call_claude(chat_text)
+        await send_long_message(update, summary)
     except Exception as e:
         logger.error(f"Error calling Claude API: {e}")
         await update.message.reply_text(
@@ -158,11 +176,63 @@ async def summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def summarize_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle uploaded files (zip or txt)."""
+    doc = update.message.document
+    file_name = doc.file_name or ""
+
+    # Only accept zip and txt files
+    if not (file_name.endswith(".zip") or file_name.endswith(".txt")):
+        await update.message.reply_text(
+            "Format file tidak didukung. Kirim file .zip (WhatsApp export) atau .txt ya!"
+        )
+        return
+
+    await update.message.chat.send_action("typing")
+    await update.message.reply_text("📂 Memproses file... tunggu sebentar ya.")
+
+    try:
+        # Download the file
+        tg_file = await doc.get_file()
+        file_bytes = await tg_file.download_as_bytearray()
+
+        # Extract text
+        if file_name.endswith(".zip"):
+            chat_text = extract_text_from_zip(bytes(file_bytes))
+        else:
+            chat_text = bytes(file_bytes).decode("utf-8", errors="replace")
+
+        if len(chat_text.strip()) < 50:
+            await update.message.reply_text(
+                "File-nya kosong atau terlalu pendek — pastikan ini file export WhatsApp yang benar."
+            )
+            return
+
+        logger.info(f"Extracted {len(chat_text)} chars from {file_name}")
+
+        # Summarize
+        await update.message.chat.send_action("typing")
+        summary = await call_claude(chat_text)
+        await send_long_message(update, summary)
+
+    except zipfile.BadZipFile:
+        await update.message.reply_text(
+            "File zip-nya rusak atau bukan format yang valid. Coba export ulang dari WhatsApp."
+        )
+    except Exception as e:
+        logger.error(f"Error processing file: {e}")
+        await update.message.reply_text(
+            "Maaf, ada error saat memproses file. Coba lagi ya!\n"
+            f"Error: {str(e)[:200]}"
+        )
+
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, summarize))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, summarize_text))
+    app.add_handler(MessageHandler(filters.Document.ALL, summarize_document))
 
     logger.info("Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
