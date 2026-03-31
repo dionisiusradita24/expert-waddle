@@ -402,6 +402,7 @@ def parse_date_range(text: str) -> tuple[datetime | None, datetime | None]:
         start = end.replace(day=1, hour=0, minute=0, second=0)
         return start, end.replace(hour=23, minute=59, second=59)
 
+    # Range: "1-15 maret" or "1-15 maret 2026"
     m = re.match(r"(\d{1,2})\s*[-–]\s*(\d{1,2})\s+(\w+)(?:\s+(\d{4}))?", text)
     if m:
         day1, day2, month_str, year_str = m.groups()
@@ -413,6 +414,20 @@ def parse_date_range(text: str) -> tuple[datetime | None, datetime | None]:
             except ValueError:
                 pass
 
+    # Single date: "30 maret" or "30 maret 2026"
+    m = re.match(r"(\d{1,2})\s+(\w+)(?:\s+(\d{4}))?$", text)
+    if m:
+        day_str, month_str, year_str = m.groups()
+        month = MONTH_MAP.get(month_str)
+        if month:
+            y = int(year_str) if year_str else year
+            try:
+                d = datetime(y, month, int(day_str))
+                return d.replace(hour=0, minute=0, second=0), d.replace(hour=23, minute=59, second=59)
+            except ValueError:
+                pass
+
+    # Cross-month range: "28 maret - 2 april"
     m = re.match(
         r"(\d{1,2})\s+(\w+)\s*[-–]|sampai|sampe|s/d\s*(\d{1,2})\s+(\w+)(?:\s+(\d{4}))?",
         text,
@@ -433,6 +448,11 @@ def parse_date_range(text: str) -> tuple[datetime | None, datetime | None]:
     return None, None
 
 
+def _clean_wa_line(line: str) -> str:
+    """Strip invisible Unicode chars that WhatsApp adds to export files."""
+    return line.lstrip("\u200e\u200f\u200b\u200c\u200d\ufeff\u202a\u202c\u2069\u2066")
+
+
 def filter_chat_by_date(chat_text: str, start_date: datetime, end_date: datetime) -> str:
     lines = chat_text.split("\n")
     filtered = []
@@ -446,9 +466,9 @@ def filter_chat_by_date(chat_text: str, start_date: datetime, end_date: datetime
     ]
 
     for line in lines:
-        matched = False
+        clean = _clean_wa_line(line)
         for pattern in date_patterns:
-            m = pattern.match(line)
+            m = pattern.match(clean)
             if m:
                 day, month, year_str = int(m.group(1)), int(m.group(2)), m.group(3)
                 yr = int(year_str)
@@ -459,12 +479,12 @@ def filter_chat_by_date(chat_text: str, start_date: datetime, end_date: datetime
                     include_line = start_date <= line_date <= end_date
                 except ValueError:
                     include_line = False
-                matched = True
                 break
 
         if include_line:
             filtered.append(line)
 
+    logger.info(f"[filter] {len(filtered)} lines matched from {len(lines)} total (range: {start_date} - {end_date})")
     return "\n".join(filtered)
 
 
@@ -801,9 +821,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["cancel"] = True
+    is_processing = context.user_data.get("processing", False)
     context.user_data.pop("chat_text", None)
     context.user_data.pop("mode", None)
-    await update.message.reply_text("⛔ Proses dibatalkan. Kirim file baru kapanpun.")
+    if is_processing:
+        await update.message.reply_text("⛔ Membatalkan proses... tunggu sebentar.")
+    else:
+        await update.message.reply_text("⛔ Proses dibatalkan. Kirim file baru kapanpun.")
     return ConversationHandler.END
 
 
@@ -909,8 +933,52 @@ async def receive_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_FOR_DATE
 
 
+async def _process_and_send(chat_id: int, message_id: int, process_text: str,
+                           mode: str, date_label: str, context: ContextTypes.DEFAULT_TYPE):
+    """Background task: call Claude, send summary + table image."""
+    bot = context.bot
+    try:
+        raw_summary = await call_claude(process_text, context, mode)
+
+        # Extract JSON table data and clean summary text
+        summary, table_data = extract_table_json(raw_summary)
+
+        # Send bullet point text summary
+        if len(summary) <= 4096:
+            await bot.send_message(chat_id=chat_id, text=summary)
+        else:
+            chunks = [summary[i : i + 4096] for i in range(0, len(summary), 4096)]
+            for chunk in chunks:
+                await bot.send_message(chat_id=chat_id, text=chunk)
+
+        # Generate and send table image if data available
+        if table_data:
+            period_label = date_label if date_label else "Semua"
+            try:
+                img_buf = create_combined_table_image(table_data, mode, period_label)
+                if img_buf:
+                    await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=img_buf,
+                        caption="📊 Tabel ringkasan (gambar)",
+                    )
+            except Exception as img_err:
+                logger.warning(f"Failed to generate table image: {img_err}")
+
+    except CancelledError:
+        await bot.send_message(chat_id=chat_id, text="⛔ Proses dibatalkan. Kirim file baru kapanpun.")
+    except Exception as e:
+        logger.error(f"Error calling Claude: {e}")
+        await bot.send_message(chat_id=chat_id, text=f"Maaf, ada error: {str(e)[:200]}")
+    finally:
+        context.user_data.pop("chat_text", None)
+        context.user_data.pop("mode", None)
+        context.user_data["cancel"] = False
+        context.user_data["processing"] = False
+
+
 async def receive_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 3: Receive date range, filter chat, summarize."""
+    """Step 3: Receive date range, filter chat, kick off background processing."""
     date_input = update.message.text
     # Remove bot mention if present
     date_input = date_input.replace(f"@{BOT_USERNAME}", "").strip()
@@ -959,40 +1027,14 @@ async def receive_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"💬 Dipecah jadi {num_chunks} bagian. Estimasi: ~{est_minutes} menit."
         )
 
-    await update.message.chat.send_action("typing")
-
-    try:
-        raw_summary = await call_claude(process_text, context, mode)
-
-        # Extract JSON table data and clean summary text
-        summary, table_data = extract_table_json(raw_summary)
-
-        # Send bullet point text summary
-        await send_long_message(update, summary)
-
-        # Generate and send table image if data available
-        if table_data:
-            period_label = date_label if (start_date and end_date) else "Semua"
-            try:
-                img_buf = create_combined_table_image(table_data, mode, period_label)
-                if img_buf:
-                    await update.message.reply_photo(
-                        photo=img_buf,
-                        caption="📊 Tabel ringkasan (gambar)",
-                    )
-            except Exception as img_err:
-                logger.warning(f"Failed to generate table image: {img_err}")
-                # Non-fatal: text summary already sent
-
-    except CancelledError:
-        await update.message.reply_text("⛔ Proses dibatalkan. Kirim file baru kapanpun.")
-    except Exception as e:
-        logger.error(f"Error calling Claude: {e}")
-        await update.message.reply_text(f"Maaf, ada error: {str(e)[:200]}")
-
-    context.user_data.pop("chat_text", None)
-    context.user_data.pop("mode", None)
-    context.user_data["cancel"] = False
+    # Launch processing as background task — ConversationHandler ends immediately
+    # so /cancel and new files can be received while processing
+    context.user_data["processing"] = True
+    chat_id = update.message.chat_id
+    message_id = update.message.message_id
+    asyncio.create_task(
+        _process_and_send(chat_id, message_id, process_text, mode, date_label, context)
+    )
     return ConversationHandler.END
 
 
