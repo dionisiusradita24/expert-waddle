@@ -1036,15 +1036,18 @@ def main():
         states={
             WAITING_FOR_CONTEXT: [
                 CommandHandler("cancel", cancel_command),
+                MessageHandler(filters.Document.ALL, receive_document),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_context),
             ],
             WAITING_FOR_DATE: [
                 CommandHandler("cancel", cancel_command),
+                MessageHandler(filters.Document.ALL, receive_document),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_date_range),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
         per_chat=True,
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", start))
