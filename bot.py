@@ -8,6 +8,7 @@ In groups: only responds when mentioned. In private chat: responds to everything
 import os
 import io
 import re
+import json
 import asyncio
 import zipfile
 import logging
@@ -22,6 +23,10 @@ from telegram.ext import (
     ContextTypes,
 )
 import anthropic
+import matplotlib
+matplotlib.use("Agg")  # Non-interactive backend for server
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 
 # --- Config ---
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -149,6 +154,29 @@ ATURAN FORMAT:
 - Kalau suatu kategori tidak ada datanya, tulis "Tidak ada data untuk periode ini"
 - Chat sangat kasual dan informal (bahasa gaul Indonesia)
 - "enci" = pemilik toko (Tionghoa), "GOR" = lapangan badminton
+
+DATA TABEL (WAJIB):
+Setelah ringkasan bullet point, WAJIB tambahkan blok JSON untuk pembuatan gambar tabel.
+Tulis persis dalam format ini di akhir output:
+
+---TABLE_JSON_START---
+{
+  "restock": [
+    {"toko": "Nama Toko", "tgl": "9 Mar", "jumlah": "8 botol", "bayar": "Lunas Rp 80rb", "ket": "-"}
+  ],
+  "posm": [
+    {"toko": "Nama Toko", "poster": "Ada", "akrilik": "Ada", "laporan": "Ya", "alasan": "-"}
+  ],
+  "retur": [
+    {"toko": "Nama Toko", "tgl": "9 Mar", "jumlah": "4 botol", "ket": "Exp besok"}
+  ]
+}
+---TABLE_JSON_END---
+
+Aturan JSON:
+- Array kosong [] jika tidak ada data untuk kategori tersebut
+- Semua value harus string
+- JANGAN masukkan kategori churn, libur, atau isu lainnya ke JSON — hanya restock, posm, retur
 """
 
 BD_PROMPT = """Kamu adalah asisten business development untuk bisnis "Refresh by Coco" — air kelapa murni segar yang di-repackage ke botol 330ml.
@@ -211,6 +239,29 @@ ATURAN FORMAT:
 - Kalau suatu kategori tidak ada datanya, tulis "Tidak ada data untuk periode ini"
 - Chat sangat kasual dan informal (bahasa gaul Indonesia)
 - "enci" = pemilik toko (Tionghoa), "GOR" = lapangan badminton
+
+DATA TABEL (WAJIB):
+Setelah ringkasan bullet point, WAJIB tambahkan blok JSON untuk pembuatan gambar tabel.
+Tulis persis dalam format ini di akhir output:
+
+---TABLE_JSON_START---
+{
+  "prospek": [
+    {"toko": "Nama Toko", "tgl": "9 Mar", "sampel": "3 botol", "status": "Pending", "next_step": "Follow up minggu depan"}
+  ],
+  "reject": [
+    {"toko": "Nama Toko", "alasan": "Sudah ada supplier"}
+  ],
+  "follow_up": [
+    {"toko": "Nama Toko", "tgl_fu": "15 Mar", "status_terakhir": "Sudah kasih sampel"}
+  ]
+}
+---TABLE_JSON_END---
+
+Aturan JSON:
+- Array kosong [] jika tidak ada data untuk kategori tersebut
+- Semua value harus string
+- JANGAN masukkan kategori isu lainnya ke JSON — hanya prospek, reject, follow_up
 """
 
 MERGE_RESTOCK_PROMPT = """Kamu menerima beberapa ringkasan parsial dari chat WhatsApp operasional (restock) yang dipecah jadi beberapa bagian.
@@ -227,6 +278,17 @@ Aturan:
 - Output tetap dalam format 6 kategori yang sama
 - JANGAN gunakan tabel — gunakan bullet point per merchant
 - Output dalam Bahasa Indonesia
+
+DATA TABEL (WAJIB):
+Di akhir ringkasan gabungan, WAJIB sertakan blok JSON gabungan dengan format:
+---TABLE_JSON_START---
+{
+  "restock": [...],
+  "posm": [...],
+  "retur": [...]
+}
+---TABLE_JSON_END---
+Gabungkan data dari semua ringkasan parsial, hapus duplikat merchant.
 """
 
 MERGE_BD_PROMPT = """Kamu menerima beberapa ringkasan parsial dari chat WhatsApp BD (business development) yang dipecah jadi beberapa bagian.
@@ -241,6 +303,17 @@ Aturan:
 - Output tetap dalam format kategori BD yang sama
 - JANGAN gunakan tabel — gunakan bullet point per toko
 - Output dalam Bahasa Indonesia
+
+DATA TABEL (WAJIB):
+Di akhir ringkasan gabungan, WAJIB sertakan blok JSON gabungan dengan format:
+---TABLE_JSON_START---
+{
+  "prospek": [...],
+  "reject": [...],
+  "follow_up": [...]
+}
+---TABLE_JSON_END---
+Gabungkan data dari semua ringkasan parsial, hapus duplikat toko.
 """
 
 
@@ -493,6 +566,172 @@ async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE, mode: 
     return merge_response.content[0].text
 
 
+# =====================================================================
+# TABLE IMAGE GENERATION
+# =====================================================================
+
+HEADER_COLOR = "#1B4332"
+HEADER_TEXT_COLOR = "white"
+ROW_COLOR_1 = "#F0F7F4"
+ROW_COLOR_2 = "white"
+
+
+def extract_table_json(text: str) -> tuple[str, dict | None]:
+    """Extract JSON block from Claude response. Returns (clean_text, json_data)."""
+    pattern = r"---TABLE_JSON_START---\s*(\{.*?\})\s*---TABLE_JSON_END---"
+    match = re.search(pattern, text, re.DOTALL)
+    if not match:
+        return text, None
+    try:
+        data = json.loads(match.group(1))
+        clean_text = text[: match.start()].rstrip()
+        return clean_text, data
+    except json.JSONDecodeError as e:
+        logger.warning(f"Failed to parse table JSON: {e}")
+        clean_text = text[: match.start()].rstrip()
+        return clean_text, None
+
+
+def create_combined_table_image(table_data: dict, mode: str, period: str = "") -> io.BytesIO | None:
+    """Generate a combined table image from structured data. Returns BytesIO or None."""
+    if mode == "restock":
+        sections = _build_restock_sections(table_data)
+    else:
+        sections = _build_bd_sections(table_data)
+
+    # Filter out empty sections
+    sections = [(title, headers, rows) for title, headers, rows in sections if rows]
+    if not sections:
+        return None
+
+    # Calculate figure size
+    total_rows = sum(len(rows) + 2 for _, _, rows in sections)  # +2 for title + header
+    fig_height = max(3, total_rows * 0.45 + 1.5)
+    max_cols = max(len(h) for _, h, _ in sections)
+    fig_width = max(8, max_cols * 2.2)
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.axis("off")
+
+    # Title
+    title_text = "Ringkasan Operasional" if mode == "restock" else "Ringkasan BD"
+    title_text += " \u2014 Refresh by Coco"
+    if period:
+        title_text += f"\nPeriode: {period}"
+    ax.set_title(title_text, fontsize=14, fontweight="bold", pad=20, loc="center")
+
+    # We stack tables vertically using subplots
+    plt.close(fig)
+
+    # Use subplots approach for multiple tables
+    n_sections = len(sections)
+    fig, axes = plt.subplots(
+        n_sections, 1,
+        figsize=(fig_width, sum(max(1.5, len(rows) * 0.45 + 1.0) for _, _, rows in sections) + 1.5),
+        gridspec_kw={"hspace": 0.6},
+    )
+    if n_sections == 1:
+        axes = [axes]
+
+    # Main title
+    fig.suptitle(title_text, fontsize=14, fontweight="bold", y=0.98)
+
+    for idx, (title, headers, rows) in enumerate(sections):
+        ax = axes[idx]
+        ax.axis("off")
+        ax.set_title(title, fontsize=11, fontweight="bold", loc="left", pad=10)
+
+        table = ax.table(
+            cellText=rows,
+            colLabels=headers,
+            loc="center",
+            cellLoc="center",
+        )
+
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1, 1.4)
+
+        # Style header
+        for j in range(len(headers)):
+            cell = table[0, j]
+            cell.set_facecolor(HEADER_COLOR)
+            cell.set_text_props(color=HEADER_TEXT_COLOR, fontweight="bold")
+            cell.set_edgecolor("white")
+
+        # Style data rows
+        for i in range(1, len(rows) + 1):
+            for j in range(len(headers)):
+                cell = table[i, j]
+                cell.set_facecolor(ROW_COLOR_1 if i % 2 == 0 else ROW_COLOR_2)
+                cell.set_edgecolor("#E0E0E0")
+
+        # Auto-fit column widths
+        table.auto_set_column_width(list(range(len(headers))))
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=180, bbox_inches="tight", facecolor="white", pad_inches=0.3)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _build_restock_sections(data: dict) -> list[tuple[str, list[str], list[list[str]]]]:
+    """Build table sections for restock mode."""
+    sections = []
+
+    # 1. Restock
+    restock = data.get("restock", [])
+    if restock:
+        headers = ["Toko", "Tgl", "Jumlah", "Bayar", "Keterangan"]
+        rows = [[r.get("toko", ""), r.get("tgl", ""), r.get("jumlah", ""), r.get("bayar", ""), r.get("ket", "-")] for r in restock]
+        sections.append(("1. RESTOCK MERCHANT", headers, rows))
+
+    # 2. POSM
+    posm = data.get("posm", [])
+    if posm:
+        headers = ["Toko", "Poster", "Akrilik", "Laporan", "Alasan"]
+        rows = [[p.get("toko", ""), p.get("poster", ""), p.get("akrilik", ""), p.get("laporan", ""), p.get("alasan", "-")] for p in posm]
+        sections.append(("2. POSM (Poster / Akrilik)", headers, rows))
+
+    # 3. Retur
+    retur = data.get("retur", [])
+    if retur:
+        headers = ["Toko", "Tgl", "Jumlah", "Keterangan"]
+        rows = [[r.get("toko", ""), r.get("tgl", ""), r.get("jumlah", ""), r.get("ket", "-")] for r in retur]
+        sections.append(("3. RETUR / PRODUK EXPIRED", headers, rows))
+
+    return sections
+
+
+def _build_bd_sections(data: dict) -> list[tuple[str, list[str], list[list[str]]]]:
+    """Build table sections for BD mode."""
+    sections = []
+
+    # 1. Prospek
+    prospek = data.get("prospek", [])
+    if prospek:
+        headers = ["Toko", "Tgl", "Sampel", "Status", "Next Step"]
+        rows = [[p.get("toko", ""), p.get("tgl", ""), p.get("sampel", ""), p.get("status", ""), p.get("next_step", "-")] for p in prospek]
+        sections.append(("1. TOKO DIKUNJUNGI (Prospek)", headers, rows))
+
+    # 2. Reject
+    reject = data.get("reject", [])
+    if reject:
+        headers = ["Toko", "Alasan"]
+        rows = [[r.get("toko", ""), r.get("alasan", "")] for r in reject]
+        sections.append(("2. TOKO REJECT", headers, rows))
+
+    # 3. Follow up
+    follow_up = data.get("follow_up", [])
+    if follow_up:
+        headers = ["Toko", "Tgl Follow Up", "Status Terakhir"]
+        rows = [[f.get("toko", ""), f.get("tgl_fu", ""), f.get("status_terakhir", "")] for f in follow_up]
+        sections.append(("3. FOLLOW UP", headers, rows))
+
+    return sections
+
+
 async def send_long_message(update: Update, text: str):
     if len(text) <= 4096:
         await update.message.reply_text(text)
@@ -671,6 +910,7 @@ async def receive_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     context.user_data["cancel"] = False
     start_date, end_date = parse_date_range(date_input)
+    date_label = ""
 
     if start_date and end_date:
         filtered_text = filter_chat_by_date(chat_text, start_date, end_date)
@@ -708,8 +948,28 @@ async def receive_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.chat.send_action("typing")
 
     try:
-        summary = await call_claude(process_text, context, mode)
+        raw_summary = await call_claude(process_text, context, mode)
+
+        # Extract JSON table data and clean summary text
+        summary, table_data = extract_table_json(raw_summary)
+
+        # Send bullet point text summary
         await send_long_message(update, summary)
+
+        # Generate and send table image if data available
+        if table_data:
+            period_label = date_label if (start_date and end_date) else "Semua"
+            try:
+                img_buf = create_combined_table_image(table_data, mode, period_label)
+                if img_buf:
+                    await update.message.reply_photo(
+                        photo=img_buf,
+                        caption="📊 Tabel ringkasan (gambar)",
+                    )
+            except Exception as img_err:
+                logger.warning(f"Failed to generate table image: {img_err}")
+                # Non-fatal: text summary already sent
+
     except CancelledError:
         await update.message.reply_text("⛔ Proses dibatalkan. Kirim file baru kapanpun.")
     except Exception as e:
@@ -741,8 +1001,20 @@ async def summarize_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
 
     try:
-        summary = await call_claude(chat_text, context, "restock")
+        raw_summary = await call_claude(chat_text, context, "restock")
+        summary, table_data = extract_table_json(raw_summary)
         await send_long_message(update, summary)
+
+        if table_data:
+            try:
+                img_buf = create_combined_table_image(table_data, "restock")
+                if img_buf:
+                    await update.message.reply_photo(
+                        photo=img_buf,
+                        caption="📊 Tabel ringkasan (gambar)",
+                    )
+            except Exception as img_err:
+                logger.warning(f"Failed to generate table image: {img_err}")
     except CancelledError:
         await update.message.reply_text("⛔ Proses dibatalkan.")
     except Exception as e:
