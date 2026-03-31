@@ -362,6 +362,7 @@ def parse_date_range(text: str) -> tuple[datetime | None, datetime | None]:
     text = text.strip().lower()
     now = datetime.now()
     year = now.year
+    logger.info(f"[parse_date] input={repr(text)} | server_now={now} | server_date={now.date()}")
 
     if text in ("semua", "all", "semuanya"):
         return None, None
@@ -997,6 +998,7 @@ async def receive_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     context.user_data["cancel"] = False
     start_date, end_date = parse_date_range(date_input)
+    logger.info(f"[receive_date] input={repr(date_input)} | parsed start={start_date} | end={end_date}")
     date_label = ""
 
     if start_date and end_date:
