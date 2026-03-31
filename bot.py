@@ -366,6 +366,21 @@ def parse_date_range(text: str) -> tuple[datetime | None, datetime | None]:
     if text in ("semua", "all", "semuanya"):
         return None, None
 
+    if text in ("kemarin", "kemaren", "yesterday"):
+        yesterday = now - timedelta(days=1)
+        return yesterday.replace(hour=0, minute=0, second=0), yesterday.replace(hour=23, minute=59, second=59)
+
+    if text in ("hari ini", "today"):
+        return now.replace(hour=0, minute=0, second=0), now.replace(hour=23, minute=59, second=59)
+
+    if text in ("3 hari terakhir", "3 hari lalu"):
+        start = now - timedelta(days=3)
+        return start.replace(hour=0, minute=0, second=0), now.replace(hour=23, minute=59, second=59)
+
+    if text in ("7 hari terakhir", "seminggu terakhir"):
+        start = now - timedelta(days=7)
+        return start.replace(hour=0, minute=0, second=0), now.replace(hour=23, minute=59, second=59)
+
     if text in ("minggu ini", "this week"):
         start = now - timedelta(days=now.weekday())
         end = now
@@ -494,8 +509,19 @@ class CancelledError(Exception):
     pass
 
 
+def _call_claude_sync(api_key: str, model: str, system: str, user_msg: str, max_tokens: int = 4096) -> str:
+    """Synchronous Claude API call — runs in a thread so it doesn't block the event loop."""
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=system,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    return response.content[0].text
+
+
 async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE, mode: str = "restock") -> str:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     chunks = split_chat_into_chunks(chat_text)
 
     system_prompt = RESTOCK_PROMPT if mode == "restock" else BD_PROMPT
@@ -507,18 +533,12 @@ async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE, mode: 
 
     if len(chunks) == 1:
         _check_cancelled()
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=4096,
-            system=system_prompt,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Tolong ringkas chat WhatsApp berikut:\n\n{chunks[0]}",
-                }
-            ],
+        result = await asyncio.to_thread(
+            _call_claude_sync, ANTHROPIC_API_KEY, CLAUDE_MODEL, system_prompt,
+            f"Tolong ringkas chat WhatsApp berikut:\n\n{chunks[0]}"
         )
-        return response.content[0].text
+        _check_cancelled()
+        return result
 
     logger.info(f"Chat too long ({len(chat_text)} chars), splitting into {len(chunks)} chunks")
     partial_summaries = []
@@ -531,18 +551,12 @@ async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE, mode: 
                 _check_cancelled()
                 await asyncio.sleep(1)
         logger.info(f"Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=4096,
-            system=system_prompt,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Tolong ringkas chat WhatsApp berikut (bagian {i+1} dari {len(chunks)}):\n\n{chunk}",
-                }
-            ],
+        result = await asyncio.to_thread(
+            _call_claude_sync, ANTHROPIC_API_KEY, CLAUDE_MODEL, system_prompt,
+            f"Tolong ringkas chat WhatsApp berikut (bagian {i+1} dari {len(chunks)}):\n\n{chunk}"
         )
-        partial_summaries.append(f"=== RINGKASAN BAGIAN {i+1} ===\n{response.content[0].text}")
+        _check_cancelled()
+        partial_summaries.append(f"=== RINGKASAN BAGIAN {i+1} ===\n{result}")
 
     _check_cancelled()
     all_summaries = "\n\n".join(partial_summaries)
@@ -552,18 +566,13 @@ async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE, mode: 
         await asyncio.sleep(1)
     logger.info(f"Merging {len(chunks)} partial summaries")
 
-    merge_response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=8192,
-        system=merge_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Gabungkan ringkasan-ringkasan parsial berikut menjadi satu ringkasan final:\n\n{all_summaries}",
-            }
-        ],
+    merge_result = await asyncio.to_thread(
+        _call_claude_sync, ANTHROPIC_API_KEY, CLAUDE_MODEL, merge_prompt,
+        f"Gabungkan ringkasan-ringkasan parsial berikut menjadi satu ringkasan final:\n\n{all_summaries}",
+        8192
     )
-    return merge_response.content[0].text
+    _check_cancelled()
+    return merge_result
 
 
 # =====================================================================
@@ -781,9 +790,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Restock — ringkasan operasional harian (6 kategori)\n"
         "• BD — ringkasan business development (4 kategori)\n\n"
         "Format tanggal:\n"
+        "• kemarin / hari ini\n"
         "• 1-15 maret\n"
         "• minggu ini / minggu lalu\n"
         "• bulan ini / bulan lalu\n"
+        "• 3 hari terakhir / 7 hari terakhir\n"
         "• semua (tanpa filter)"
     )
 
@@ -888,9 +899,11 @@ async def receive_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Mode: {mode_label}\n\n"
         "Mau ringkasan untuk tanggal berapa?\n\n"
         "Contoh:\n"
+        "• kemarin\n"
+        "• hari ini\n"
         "• 1-15 maret\n"
-        "• minggu ini\n"
-        "• bulan lalu\n"
+        "• minggu ini / minggu lalu\n"
+        "• 3 hari terakhir\n"
         "• semua (tanpa filter tanggal)"
     )
     return WAITING_FOR_DATE
