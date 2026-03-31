@@ -2,6 +2,7 @@
 Refresh by Coco — WhatsApp Chat Summary Bot for Telegram
 Supports two modes: RESTOCK (daily ops) and BD (business development).
 Includes date filtering, chunking, /cancel support.
+In groups: only responds when mentioned. In private chat: responds to everything.
 """
 
 import os
@@ -30,6 +31,9 @@ MAX_CHARS_PER_CHUNK = 50000
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Bot username — set on startup
+BOT_USERNAME = ""
 
 # --- Conversation states ---
 WAITING_FOR_CONTEXT = 1
@@ -76,42 +80,63 @@ TIM YANG ADA DI CHAT:
 
 TUGAS:
 Ringkas chat WhatsApp ke dalam 6 kategori berikut. Output HARUS dalam Bahasa Indonesia.
-Karena Telegram tidak support tabel HTML, gunakan format monospace block (```) untuk tabel supaya kolom sejajar.
+Format: bullet point per merchant, BUKAN tabel. Mudah dibaca di HP.
 
 6 KATEGORI OUTPUT:
 
 1. RESTOCK MERCHANT
-   Format kolom: Nama Toko | Tgl | Jumlah | Status Bayar | Keterangan
-   - Merchant mana yang di-restock, berapa botol, kapan
+   Tulis per merchant dengan format:
+   • [Nama Toko] — [tanggal]
+     - Isi: [jumlah] botol
+     - Bayar: [status bayar + jumlah kalau ada]
+     - Ket: [keterangan tambahan kalau ada]
+
+   Panduan status bayar:
+   - "Bayar" / "udah bayar" / "cash" / "transfer" = Lunas. Catat jumlahnya.
+   - "Nanti aja" / "akhir bulan" / "bulanan" = Bayar bulanan
+   - Kalau tidak disebutkan = tulis "Tidak disebutkan"
    - "Titip" / "isi" / "taruh" = restock
-   - Status bayar: "Lunas [jumlah]" / "Bayar bulanan" / "Belum bayar" / "Tidak disebutkan"
-   - "Bayar" / "udah bayar" / "cash" / "transfer" = lunas. Catat jumlahnya kalau disebutkan.
-   - "Nanti aja" / "akhir bulan" / "bulanan" = bayar bulanan
    - Satuan selalu BOTOL
 
 2. POSM (Poster / Akrilik)
-   Format kolom: Nama Toko | Poster | Akrilik | Info dari Karyawan | Alasan Tidak Pasang
-   - Poster: "Ada" / "Tidak ada" / "Tidak disebutkan"
-   - Akrilik: "Ada" / "Tidak ada" / "Tidak disebutkan"
-   - Info dari karyawan: "Ya" / "Tidak" — apakah karyawan/kurir melaporkan status POSM
-   - Alasan tidak pasang: isi alasannya kalau disebutkan (misal "gamau", "tidak ada tempat", "belum sempat"), atau "-" kalau sudah ada atau tidak disebutkan
+   Tulis per merchant dengan format:
+   • [Nama Toko]
+     - Poster: [Ada / Tidak ada / Tidak disebutkan]
+     - Akrilik: [Ada / Tidak ada / Tidak disebutkan]
+     - Dilaporkan karyawan: [Ya / Tidak]
+     - Alasan tidak pasang: [alasan / -]
+
    - "Tempel" / "pasang" / "poster" / "akrilik" = POSM
 
 3. RETUR / PRODUK EXPIRED
-   Format kolom: Nama Toko | Tgl | Jumlah | Keterangan
+   Tulis per merchant dengan format:
+   • [Nama Toko] — [tanggal]
+     - Jumlah: [jumlah] botol
+     - Ket: [keterangan, misal "exp besok", "sudah basi"]
+
    - Karena shelf life pendek, retur itu NORMAL dan sering terjadi
    - "Ambil balik" / "tarik" / "expired" / "basi" / "exp" = retur
 
 4. MERCHANT CHURN
-   - Merchant yang berhenti atau minta stop bawa produk
-   - Sertakan alasan kalau disebutkan
+   Tulis per merchant dengan format:
+   • [Nama Toko] — [alasan kalau disebutkan]
+
    - "Gamau lagi" / "stop" / "tarik semua" = churn
 
 5. MERCHANT LIBUR / TUTUP SEMENTARA
-   Format kolom: Nama Toko | Mulai Libur | Buka Kembali | Keterangan
+   Tulis per merchant dengan format:
+   • [Nama Toko]
+     - Libur mulai: [tanggal]
+     - Buka kembali: [tanggal / belum ada info]
+     - Ket: [keterangan, misal "pulkam", "renovasi"]
+
    - "Libur" / "pulkam" / "tutup dulu" = libur sementara
 
 6. TOPIK / ISU LAINNYA
+   Tulis per topik dengan bullet point:
+   • [topik]: [detail]
+
+   Meliputi:
    - Operasional & logistik (macet, motor rusak, stiker habis, dll)
    - Keuangan (gaji, pembayaran merchant, insentif)
    - Info kompetitor dari lapangan
@@ -120,8 +145,7 @@ Karena Telegram tidak support tabel HTML, gunakan format monospace block (```) u
 
 ATURAN FORMAT:
 - Output dalam Bahasa Indonesia
-- Gunakan monospace block (```) untuk semua tabel supaya kolom sejajar di Telegram
-- Gunakan poin (-) untuk Churn dan Isu Lainnya
+- JANGAN gunakan tabel atau monospace block — gunakan bullet point saja
 - Kalau suatu kategori tidak ada datanya, tulis "Tidak ada data untuk periode ini"
 - Chat sangat kasual dan informal (bahasa gaul Indonesia)
 - "enci" = pemilik toko (Tionghoa), "GOR" = lapangan badminton
@@ -143,30 +167,39 @@ TIM YANG ADA DI CHAT:
 
 TUGAS:
 Ringkas chat WhatsApp dari grup BD ke dalam kategori berikut. Output HARUS dalam Bahasa Indonesia.
-Karena Telegram tidak support tabel HTML, gunakan format monospace block (```) untuk tabel.
+Format: bullet point per toko, BUKAN tabel. Mudah dibaca di HP.
 
 KATEGORI OUTPUT:
 
 1. TOKO YANG DIKUNJUNGI (prospek)
-   Format kolom: Nama Toko | Tgl | Sampel | Status | Next Step | Stok Masuk | No HP | Keterangan
-   - Sampel: berapa botol sampel yang diberikan ("kasih sampel" / "coba" / "tester")
-   - Status: "OK jadi merchant" / "Pending" / "Reject" / "Follow up"
-   - Next step (kalau reject/pending): apa yang perlu dilakukan selanjutnya
-   - Stok masuk (kalau OK): berapa botol pertama yang dititip
-   - No HP: nomor telepon toko/pemilik kalau disebutkan
-   - Keterangan: info tambahan (lokasi, tipe toko, nama pemilik, alasan reject, dll)
+   Tulis per toko dengan format:
+   • [Nama Toko] — [tanggal]
+     - Sampel: [jumlah botol yang dikasih / tidak ada]
+     - Status: [OK jadi merchant / Pending / Reject / Follow up]
+     - Next step: [apa yang perlu dilakukan / -]
+     - Stok masuk: [jumlah botol pertama yang dititip / belum]
+     - No HP: [nomor kalau disebutkan / -]
+     - Ket: [lokasi, tipe toko, nama pemilik, dll]
+
+   - "Kasih sampel" / "coba" / "tester" = sampel
+   - "Gamau" / "ga tertarik" / "udah ada supplier" = reject
+   - "Nanti aja" / "pikir dulu" / "hubungi lagi" = follow up
 
 2. TOKO REJECT
-   - Toko yang menolak jadi merchant
-   - Sertakan alasan reject kalau disebutkan
-   - "Gamau" / "ga tertarik" / "udah ada supplier" / "reject" = reject
+   Tulis per toko dengan format:
+   • [Nama Toko] — [alasan reject]
 
 3. FOLLOW UP
-   - Toko yang perlu di-follow up / dikunjungi lagi
-   - Tanggal follow up kalau disebutkan
-   - Status terakhir (misal: "sudah kasih sampel, tunggu feedback")
+   Tulis per toko dengan format:
+   • [Nama Toko]
+     - Tanggal follow up: [tanggal / belum ditentukan]
+     - Status terakhir: [misal "sudah kasih sampel, tunggu feedback"]
 
 4. TOPIK / ISU LAINNYA
+   Tulis per topik dengan bullet point:
+   • [topik]: [detail]
+
+   Meliputi:
    - Masalah di lapangan (area susah dijangkau, parkir, dll)
    - Insight pasar (kompetitor, harga pasaran, permintaan)
    - Strategi atau arahan dari owner
@@ -174,8 +207,7 @@ KATEGORI OUTPUT:
 
 ATURAN FORMAT:
 - Output dalam Bahasa Indonesia
-- Gunakan monospace block (```) untuk tabel
-- Gunakan poin (-) untuk Reject, Follow Up, dan Isu Lainnya
+- JANGAN gunakan tabel atau monospace block — gunakan bullet point saja
 - Kalau suatu kategori tidak ada datanya, tulis "Tidak ada data untuk periode ini"
 - Chat sangat kasual dan informal (bahasa gaul Indonesia)
 - "enci" = pemilik toko (Tionghoa), "GOR" = lapangan badminton
@@ -193,7 +225,7 @@ Aturan:
 - Untuk churn dan libur, pastikan tidak ada duplikat
 - Untuk isu lainnya, gabungkan semua poin unik
 - Output tetap dalam format 6 kategori yang sama
-- Gunakan monospace block (```) untuk tabel
+- JANGAN gunakan tabel — gunakan bullet point per merchant
 - Output dalam Bahasa Indonesia
 """
 
@@ -207,9 +239,46 @@ Aturan:
 - Untuk reject dan follow up, pastikan tidak ada duplikat
 - Untuk isu lainnya, gabungkan semua poin unik
 - Output tetap dalam format kategori BD yang sama
-- Gunakan monospace block (```) untuk tabel
+- JANGAN gunakan tabel — gunakan bullet point per toko
 - Output dalam Bahasa Indonesia
 """
+
+
+# =====================================================================
+# HELPER: Check if bot is addressed in group
+# =====================================================================
+
+def is_bot_addressed(update: Update) -> bool:
+    """Check if the bot should respond to this message.
+    - Private chat: always respond
+    - Group chat: only if mentioned or replying to the bot
+    """
+    if update.message.chat.type == "private":
+        return True
+
+    # Check if bot is mentioned in text
+    if update.message.text and f"@{BOT_USERNAME}" in update.message.text:
+        return True
+
+    # Check if message is a reply to the bot
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        if update.message.reply_to_message.from_user.username == BOT_USERNAME:
+            return True
+
+    # Check if bot is mentioned in caption (for files sent with caption)
+    if update.message.caption and f"@{BOT_USERNAME}" in update.message.caption:
+        return True
+
+    # Check entities for bot mention
+    entities = update.message.entities or update.message.caption_entities or []
+    for entity in entities:
+        if entity.type == "mention":
+            text = update.message.text or update.message.caption or ""
+            mention = text[entity.offset : entity.offset + entity.length]
+            if mention.lower() == f"@{BOT_USERNAME.lower()}":
+                return True
+
+    return False
 
 
 # =====================================================================
@@ -353,7 +422,6 @@ class CancelledError(Exception):
 
 
 async def call_claude(chat_text: str, context: ContextTypes.DEFAULT_TYPE, mode: str = "restock") -> str:
-    """Send chat text to Claude with the appropriate prompt based on mode."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     chunks = split_chat_into_chunks(chat_text)
 
@@ -438,6 +506,14 @@ async def send_long_message(update: Update, text: str):
 # HANDLERS
 # =====================================================================
 
+async def post_init(application: Application):
+    """Called after bot starts — fetch bot username for mention detection."""
+    global BOT_USERNAME
+    bot = await application.bot.get_me()
+    BOT_USERNAME = bot.username
+    logger.info(f"Bot username: @{BOT_USERNAME}")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Halo! Aku bot ringkasan WhatsApp untuk Refresh by Coco 🥥\n\n"
@@ -447,6 +523,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Masukkan range tanggal\n"
         "4. Tunggu sebentar, ringkasan muncul!\n\n"
         "Atau paste chat langsung sebagai text.\n\n"
+        f"Di grup: mention @{BOT_USERNAME} atau reply ke pesan bot\n\n"
         "/cancel — Batalkan proses\n"
         "/help — Bantuan lengkap"
     )
@@ -460,6 +537,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/cancel — Batalkan proses\n\n"
         "📎 Kirim file zip/txt → pilih konteks → tanggal → ringkasan\n"
         "📝 Atau paste chat langsung (default: mode Restock)\n\n"
+        f"Di grup: mention @{BOT_USERNAME} atau reply ke pesan bot\n\n"
         "2 mode tersedia:\n"
         "• Restock — ringkasan operasional harian (6 kategori)\n"
         "• BD — ringkasan business development (4 kategori)\n\n"
@@ -480,7 +558,26 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 1: Receive file, ask for context (Restock or BD)."""
+    """Step 1: Receive file. In groups, only respond if bot is mentioned/replied to."""
+    # In groups, check if bot is addressed
+    if update.message.chat.type != "private":
+        # Check caption for mention, or if it's a reply to the bot
+        is_addressed = False
+        if update.message.caption and f"@{BOT_USERNAME}" in update.message.caption:
+            is_addressed = True
+        if update.message.reply_to_message and update.message.reply_to_message.from_user:
+            if update.message.reply_to_message.from_user.username == BOT_USERNAME:
+                is_addressed = True
+        # Check caption entities
+        for entity in (update.message.caption_entities or []):
+            if entity.type == "mention":
+                caption = update.message.caption or ""
+                mention = caption[entity.offset : entity.offset + entity.length]
+                if mention.lower() == f"@{BOT_USERNAME.lower()}":
+                    is_addressed = True
+        if not is_addressed:
+            return ConversationHandler.END
+
     doc = update.message.document
     file_name = doc.file_name or ""
 
@@ -530,6 +627,8 @@ async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 2: Receive context selection (restock or bd), ask for date range."""
     text = update.message.text.strip().lower()
+    # Remove bot mention if present
+    text = text.replace(f"@{BOT_USERNAME.lower()}", "").strip()
 
     if text in ("restock", "1", "restok"):
         context.user_data["mode"] = "restock"
@@ -560,6 +659,9 @@ async def receive_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 3: Receive date range, filter chat, summarize."""
     date_input = update.message.text
+    # Remove bot mention if present
+    date_input = date_input.replace(f"@{BOT_USERNAME}", "").strip()
+
     chat_text = context.user_data.get("chat_text", "")
     mode = context.user_data.get("mode", "restock")
 
@@ -621,8 +723,13 @@ async def receive_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def summarize_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle plain text paste — defaults to restock mode."""
+    """Handle plain text paste. In groups, only respond if mentioned."""
+    if not is_bot_addressed(update):
+        return
+
     chat_text = update.message.text
+    # Remove bot mention
+    chat_text = chat_text.replace(f"@{BOT_USERNAME}", "").strip()
 
     if len(chat_text) < 50:
         await update.message.reply_text(
@@ -648,7 +755,7 @@ async def summarize_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("cancel", cancel_command), group=-1)
 
@@ -665,6 +772,7 @@ def main():
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
+        per_chat=True,
     )
 
     app.add_handler(CommandHandler("start", start))
