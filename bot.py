@@ -798,6 +798,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 1: Receive file. In groups, only respond if bot is mentioned/replied to."""
+    logger.info(f"[receive_document] CALLED! chat_type={update.message.chat.type}")
     # In groups, check if bot is addressed
     if update.message.chat.type != "private":
         # Check caption for mention, or if it's a reply to the bot
@@ -1026,8 +1027,41 @@ async def summarize_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # =====================================================================
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global error handler — log errors and notify user."""
+    logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
+    if update and hasattr(update, "message") and update.message:
+        try:
+            await update.message.reply_text(
+                f"❌ Error: {str(context.error)[:300]}\n\nCoba lagi atau kirim /cancel."
+            )
+        except Exception:
+            pass
+
+
+async def debug_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug handler — log every incoming update."""
+    msg = update.message
+    if msg:
+        chat_type = msg.chat.type
+        has_doc = msg.document is not None
+        doc_name = msg.document.file_name if msg.document else "N/A"
+        has_text = msg.text is not None
+        logger.info(
+            f"[DEBUG] chat_type={chat_type} | has_doc={has_doc} | "
+            f"doc_name={doc_name} | has_text={has_text} | "
+            f"caption={msg.caption or 'N/A'}"
+        )
+
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+
+    # Global error handler
+    app.add_error_handler(error_handler)
+
+    # Debug logger for all updates (group -2 = runs before everything, doesn't block)
+    app.add_handler(MessageHandler(filters.ALL, debug_all_updates), group=-2)
 
     app.add_handler(CommandHandler("cancel", cancel_command), group=-1)
 
