@@ -465,6 +465,11 @@ def filter_chat_by_date(chat_text: str, start_date: datetime, end_date: datetime
         re.compile(r"^\[(\d{1,2})/(\d{1,2})/(\d{2})"),
     ]
 
+    # Debug: log first 3 lines raw bytes to see exact format
+    for i, sample in enumerate(lines[:3]):
+        logger.info(f"[filter] RAW line {i}: {repr(sample[:80])}")
+        logger.info(f"[filter] CLEAN line {i}: {repr(_clean_wa_line(sample)[:80])}")
+
     for line in lines:
         clean = _clean_wa_line(line)
         for pattern in date_patterns:
